@@ -1,0 +1,7 @@
+data/
+src/__pycache__/
+src/.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+*.pyc
+*.tif
+*.tiff
