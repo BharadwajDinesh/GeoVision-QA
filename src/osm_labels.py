@@ -1,8 +1,9 @@
 """
 osm_labels.py
 -------------
-Downloads OpenStreetMap features for a geographic bounding box and
-rasterizes them into a pixel-level segmentation mask.
+Downloads OpenStreetMap features for a geographic bounding box,
+rasterizes them into a pixel-level segmentation mask, and saves
+the result directly to GCS.
 
 Classes:
     0 = background
@@ -13,20 +14,28 @@ Classes:
 
 Usage:
     from osm_labels import OSMLabeler
-    labeler = OSMLabeler(bounds, crs, height, width, transform)
-    full_mask = labeler.build_mask()
+    labeler = OSMLabeler()                   # reads GeoTIFF meta from GCS
+    full_mask = labeler.build_mask()         # downloads OSM + rasterizes
+    labeler.save_mask_to_gcs(full_mask)      # uploads mask to GCS
 """
 
+import io
 import numpy as np
 import geopandas as gpd
 import osmnx as ox
-from rasterio.features import rasterize
+import rasterio
+import rasterio.features
 from rasterio.transform import Affine
-from pathlib import Path
+from google.cloud import storage
+
+
+# ── GCS config ────────────────────────────────────────────────────────────────
+GCS_BUCKET      = "geovision-data"
+GCS_TIF_PATH    = "geovision/phase1/bengaluru_s2_composite_2024.tif"
+GCS_MASK_PATH   = "geovision/phase2/full_mask.npy"
 
 
 # ── Class definitions ─────────────────────────────────────────────────────────
-
 CLASS_MAP = {
     'background': 0,
     'building':   1,
@@ -54,58 +63,55 @@ OSM_TAGS = {
         'natural': ['wood', 'scrub', 'grassland', 'heath'],
     },
     'water': {
-        'natural':   ['water'],
-        'waterway':  ['river', 'stream', 'canal', 'drain'],
-        'landuse':   ['reservoir', 'basin'],
+        'natural':  ['water'],
+        'waterway': ['river', 'stream', 'canal', 'drain'],
+        'landuse':  ['reservoir', 'basin'],
     },
 }
 
-# Rasterization priority (higher = drawn on top, wins overlap)
-# Buildings most specific → on top
+# Rasterization priority — last drawn wins on overlap
+# Buildings most specific → drawn last → highest priority
 LAYER_ORDER = ['vegetation', 'water', 'road', 'building']
 
 
 class OSMLabeler:
     """
     Downloads and rasterizes OSM features into a segmentation mask.
-
-    Args:
-        bounds:    Rasterio BoundingBox (left, bottom, right, top)
-        crs:       Coordinate reference system of the target raster
-        height:    Height of the output mask in pixels
-        width:     Width of the output mask in pixels
-        transform: Rasterio Affine transform of the target raster
+    Reads GeoTIFF metadata from GCS. Saves full mask back to GCS.
     """
 
-    def __init__(
-        self,
-        bounds,
-        crs,
-        height: int,
-        width: int,
-        transform: Affine,
-    ):
-        self.bounds    = bounds
-        self.crs       = crs
-        self.height    = height
-        self.width     = width
-        self.transform = transform
+    def __init__(self):
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(GCS_BUCKET)
 
-        # bbox in (S, W, N, E) format for osmnx
-        self.bbox = (bounds.bottom, bounds.left, bounds.top, bounds.right)
+        # Read raster metadata from GCS (no need to load full image)
+        print(f"Reading raster metadata from gs://{GCS_BUCKET}/{GCS_TIF_PATH} ...")
+        blob  = self.bucket.blob(GCS_TIF_PATH)
+        data  = blob.download_as_bytes()
+        with rasterio.open(io.BytesIO(data)) as src:
+            self.bounds    = src.bounds
+            self.crs       = src.crs
+            self.height    = src.height
+            self.width     = src.width
+            self.transform = src.transform
 
-        self._gdfs = {}   # cache downloaded GeoDataFrames
+        # bbox in (south, west, north, east) format for osmnx
+        self.bbox = (
+            self.bounds.bottom,
+            self.bounds.left,
+            self.bounds.top,
+            self.bounds.right,
+        )
+
+        self._gdfs = {}   # cache of downloaded GeoDataFrames
+        print(f"  Bounds : {self.bounds}")
+        print(f"  Size   : {self.width} x {self.height} px")
+        print(f"  CRS    : {self.crs}")
+
+    # ── Download ──────────────────────────────────────────────────────────────
 
     def download(self, class_name: str) -> gpd.GeoDataFrame:
-        """
-        Download OSM features for a single class.
-
-        Args:
-            class_name: One of 'building', 'road', 'vegetation', 'water'
-
-        Returns:
-            GeoDataFrame with geometry column, or empty GeoDataFrame on failure
-        """
+        """Download OSM features for a single class."""
         if class_name in self._gdfs:
             return self._gdfs[class_name]
 
@@ -121,27 +127,16 @@ class OSMLabeler:
         return gdf
 
     def download_all(self) -> None:
-        """Download all OSM classes. Call this before build_mask()."""
-        print("Downloading OSM features...")
+        """Download all OSM classes."""
+        print("\nDownloading OSM features...")
         for class_name in LAYER_ORDER:
             self.download(class_name)
-        print("Download complete.\n")
+        print("Download complete.")
 
-    def _rasterize_layer(
-        self,
-        gdf: gpd.GeoDataFrame,
-        class_id: int,
-    ) -> np.ndarray:
-        """
-        Burn a GeoDataFrame into a 2D numpy array.
+    # ── Rasterize ─────────────────────────────────────────────────────────────
 
-        Args:
-            gdf:      GeoDataFrame to rasterize
-            class_id: Integer class label to burn
-
-        Returns:
-            2D uint8 array of shape (height, width)
-        """
+    def _rasterize_layer(self, gdf: gpd.GeoDataFrame, class_id: int) -> np.ndarray:
+        """Burn a GeoDataFrame into a 2D uint8 array."""
         out = np.zeros((self.height, self.width), dtype=np.uint8)
 
         if gdf is None or len(gdf) == 0:
@@ -157,7 +152,7 @@ class OSMLabeler:
         if not geoms:
             return out
 
-        burned = rasterize(
+        burned = rasterio.features.rasterize(
             [(geom, class_id) for geom in geoms],
             out_shape=(self.height, self.width),
             transform=self.transform,
@@ -169,10 +164,8 @@ class OSMLabeler:
 
     def build_mask(self) -> np.ndarray:
         """
-        Build the full-scene segmentation mask by rasterizing all layers.
-
-        Layers are applied in LAYER_ORDER — buildings drawn last so they
-        win any overlap with roads or vegetation.
+        Build the full-scene segmentation mask.
+        Downloads OSM data if not already cached.
 
         Returns:
             2D uint8 numpy array of shape (height, width)
@@ -183,14 +176,13 @@ class OSMLabeler:
 
         mask = np.zeros((self.height, self.width), dtype=np.uint8)
 
-        print("Rasterizing layers...")
+        print("\nRasterizing layers...")
         for class_name in LAYER_ORDER:
             gdf      = self._gdfs.get(class_name, gpd.GeoDataFrame())
             class_id = CLASS_MAP[class_name]
             layer    = self._rasterize_layer(gdf, class_id)
-            # Overwrite mask where this layer has labels
-            mask = np.where(layer > 0, layer, mask)
-            pct  = (mask == class_id).sum() / mask.size * 100
+            mask     = np.where(layer > 0, layer, mask)
+            pct      = (mask == class_id).sum() / mask.size * 100
             print(f"  {class_name:12s} ({class_id}): {pct:.1f}% of scene")
 
         # Print final class distribution
@@ -202,11 +194,29 @@ class OSMLabeler:
 
         return mask
 
-    def save_mask(self, mask: np.ndarray, path: str | Path) -> None:
-        """Save the mask as a .npy file."""
-        np.save(path, mask)
-        print(f"Mask saved → {path}")
+    # ── GCS I/O ───────────────────────────────────────────────────────────────
 
-    def load_mask(self, path: str | Path) -> np.ndarray:
-        """Load a previously saved mask."""
-        return np.load(path)
+    def save_mask_to_gcs(self, mask: np.ndarray) -> None:
+        """Upload the full mask numpy array to GCS."""
+        buf = io.BytesIO()
+        np.save(buf, mask)
+        buf.seek(0)
+        blob = self.bucket.blob(GCS_MASK_PATH)
+        blob.upload_from_file(buf, content_type="application/octet-stream")
+        print(f"\nMask saved → gs://{GCS_BUCKET}/{GCS_MASK_PATH}")
+        print(f"  Shape          : {mask.shape}")
+        print(f"  Unique classes : {np.unique(mask)}")
+
+    def load_mask_from_gcs(self) -> np.ndarray:
+        """Download a previously saved mask from GCS."""
+        print(f"Loading mask from gs://{GCS_BUCKET}/{GCS_MASK_PATH} ...")
+        blob = self.bucket.blob(GCS_MASK_PATH)
+        data = blob.download_as_bytes()
+        mask = np.load(io.BytesIO(data))
+        print(f"  Mask loaded: shape={mask.shape}, classes={np.unique(mask)}")
+        return mask
+
+    def mask_exists_in_gcs(self) -> bool:
+        """Check if a full mask already exists in GCS."""
+        blob = self.bucket.blob(GCS_MASK_PATH)
+        return blob.exists()
