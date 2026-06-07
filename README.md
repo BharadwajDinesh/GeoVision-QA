@@ -15,9 +15,9 @@ Phase 1: Data Ingestion & Spectral Analysis      ✅ Complete
         ↓
 Phase 2: Object Detection & Segmentation         ✅ Complete
         ↓
-Phase 3: Change Detection (ChangeFormer)         🔜 In Progress
+Phase 3: Change Detection (SegFormer)            ✅ Complete
         ↓
-Phase 4: VLM + RAG Deployment (LLaVA + FastAPI)  🔜 Coming Soon
+Phase 4: VLM + RAG Deployment (LLaVA + FastAPI)  🔜 In Progress
 ```
 
 ---
@@ -35,7 +35,10 @@ geovision/
 │   ├── tile_slicer.py       # GeoTIFF → 512x512 patch slicing
 │   ├── seg_dataset.py       # PyTorch Dataset for SegFormer training
 │   ├── train.py             # SegFormer fine-tuning script
-│   └── phase2_run.py        # Phase 2 end-to-end pipeline runner
+│   ├── phase2_run.py        # Phase 2 end-to-end pipeline runner
+│   ├── phase3_run.py        # Pull 2015 Koramangala composite
+│   ├── phase3_2024.py       # Pull 2024 Koramangala composite
+│   └── phase3_infer.py      # Change detection inference pipeline
 ├── notebooks/
 │   └── phase1_data_ingestion.ipynb
 ├── .gitignore
@@ -54,15 +57,16 @@ geovision/
 ## Phase 1 — Data Ingestion & Spectral Analysis ✅
 
 ### What it does
-- Connects to Google Earth Engine and pulls Sentinel-2 multispectral imagery over Bengaluru
-- Applies cloud masking using QA60 band (bits 10 & 11 for opaque cloud + cirrus)
-- Builds a median composite from multiple scenes to get a single clean image
+- Connects to Google Earth Engine and pulls Sentinel-2 multispectral
+  imagery over Bengaluru (30x30km area)
+- Applies cloud masking using QA60 band (bits 10 & 11)
+- Builds a median composite from multiple scenes
 - Computes spectral indices for land cover analysis
 - Exports processed GeoTIFF to Google Cloud Storage
 
 ### Output
-- **File:** `bengaluru_s2_composite_2024_indexed.tif`
-- **Size:** 3064 × 3006 px (~30×30 km area)
+- **File:** `bengaluru_s2_composite_2024.tif`
+- **Size:** 3064 x 3006 px (~30x30 km)
 - **Bands:** 6 Sentinel-2 bands (B2, B3, B4, B8, B11, B12)
 - **CRS:** EPSG:4326
 - **Stored:** `gs://geovision-data/geovision/phase1/`
@@ -100,7 +104,7 @@ as_float=False flag to skip the second division.
 - Downloads OpenStreetMap features for Koramangala, Bengaluru
 - Rasterizes building footprints, roads, vegetation, and water bodies
   into pixel-level segmentation masks
-- Slices the large GeoTIFF into 512×512 patches with 64px overlap
+- Slices the large GeoTIFF into 512x512 patches with 64px overlap
 - Fine-tunes SegFormer-b2 on the generated tiles
 - All data flows through GCS — nothing stored locally
 
@@ -116,7 +120,7 @@ as_float=False flag to skip the second division.
 ### Model — SegFormer-b2
 - Base model  : `nvidia/segformer-b2-finetuned-ade-512-512`
 - Fine-tuned  : On 8 Bengaluru/Koramangala tiles
-- Input       : RGB (3 bands), 512×512 patches
+- Input       : RGB (3 bands), 512x512 patches
 - Output      : 5-class segmentation mask
 - Optimizer   : AdamW (lr=6e-5, weight_decay=0.01)
 - Loss        : Weighted CrossEntropy (handles class imbalance)
@@ -151,7 +155,7 @@ Checkpoint saved to GCS
 - **64px overlap** — prevents objects at tile boundaries from being cut off
 - **min_label_pct filter** — skips tiles that are mostly background
 - **Class weights** — [0.5, 2.0, 2.0, 1.5, 3.0] to handle class imbalance
-- **Transfer learning** — fine-tune NVIDIA pretrained SegFormer, not from scratch
+- **Transfer learning** — fine-tune NVIDIA pretrained SegFormer
 
 ### GCS Artifacts
 ```
@@ -169,30 +173,79 @@ for native 6-band support and domain-specific pretraining.
 
 ---
 
-## Phase 3 — Change Detection 🔜
+## Phase 3 — Change Detection ✅
 
-### Goal
-Detect what changed between two satellite images of the same area
-at different points in time — new buildings, deforestation, urban
-growth, flood damage.
+### What it does
+- Pulls two Sentinel-2 composites of the same area at different times:
+  - 2015 composite (Jun 2015 - Dec 2016, 9 scenes)
+  - 2024 composite (Jan 2024 - May 2024)
+- Area of interest: Koramangala, Bengaluru (1km buffer)
+- Reprojects 2024 image to exactly match 2015 pixel grid
+- Runs fine-tuned SegFormer on both images independently
+- Compares segmentation masks pixel by pixel to detect changes
 
-### Plan
+### Area of Interest
 ```
-Bengaluru 2020 Sentinel-2 composite (Phase 1 pipeline)
+Location  : Koramangala, Bengaluru, India
+Center    : 12.9411°N, 77.6158°E
+Buffer    : 1km radius
+Image size: ~200x200 pixels (10m Sentinel-2 resolution)
+```
+
+### Change Detection Approach
+```
+2015 Sentinel-2 image
+        ↓
+SegFormer → Segmentation mask 2015
         +
-Bengaluru 2024 Sentinel-2 composite (already done)
+2024 Sentinel-2 image
         ↓
-ChangeFormer model
+SegFormer → Segmentation mask 2024
         ↓
-Binary/multi-class change map
-(what appeared / disappeared between 2020 and 2024)
+Pixel-by-pixel comparison
+        ↓
+Change map with 4 change types
 ```
 
-### Model — ChangeFormer
-- Siamese transformer architecture
-- Takes two images as input, outputs change mask
-- Dataset: LEVIR-CD (large building change detection dataset)
-- Use cases: Urban growth, deforestation, flood damage detection
+### Change Types Detected
+| Change Type           | Color  | Meaning                    |
+|-----------------------|--------|----------------------------|
+| Vegetation → Building | Red    | New construction           |
+| Background → Building | Orange | New construction on empty  |
+| Building → Vegetation | Green  | Demolition / greening      |
+| Building → Background | Gray   | Demolition                 |
+
+### Results (Koramangala 2015 → 2024)
+```
+Class Distribution:
+                  2015      2024      Change
+Background      : 30.2%  → 27.8%    -2.4%
+Building        : 57.7%  → 44.6%    -13.1%
+Vegetation      : 11.5%  → 25.2%    +13.7%
+Water           :  0.6%  →  2.4%    +1.8%
+```
+
+### Key Engineering Challenges Solved
+- **Earth Engine grid snapping** — exports from different dates land on
+  slightly different pixel grids. Fixed using rasterio reproject to align
+  2024 exactly to 2015 transform.
+- **No-data pixels** — reprojection creates black border pixels which
+  SegFormer misclassifies as water. Fixed by filling no-data regions with
+  per-band mean values before inference.
+- **Single scene in 2015** — initial query with tight cloud filter returned
+  only 1 scene (nearly unusable). Fixed by widening date range to 18 months
+  and relaxing cloud threshold to 30%.
+
+### GCS Artifacts
+```
+gs://geovision-data/geovision/phase3/
+├── koramangala_s2_2015.tif        # 2015 Sentinel-2 composite
+├── koramangala_s2_2024.tif        # 2024 Sentinel-2 composite
+├── seg_2015.npy                   # Segmentation mask 2015
+├── seg_2024.npy                   # Segmentation mask 2024
+├── change_map.npy                 # Binary change map
+└── change_detection_result.png    # Visualization
+```
 
 ---
 
@@ -206,9 +259,22 @@ Natural language question answering over satellite imagery.
 - FastAPI endpoint on GCP VM
 - Docker containerization
 - Live endpoint answering questions like:
-  - "How many buildings are in this area?"
-  - "Has vegetation decreased since 2023?"
-  - "What changed in this region after the flood?"
+  - "What changed in Koramangala since 2015?"
+  - "How many new buildings appeared?"
+  - "Has vegetation decreased?"
+  - "What is the land cover of this area?"
+
+### Deployment Stack
+```
+FastAPI (serves the API)
+    ↓
+SegFormer  (segmentation  — Phase 2)
+ChangeFormer (change detection — Phase 3)
+LLaVA + RAG  (VQA — Phase 4)
+    ↓
+Docker (containerised)
+GCP VM (hosted)
+```
 
 ---
 
@@ -239,6 +305,17 @@ gcloud auth application-default login
 python src/phase2_run.py
 ```
 
+### Run Phase 3 — Pull Data
+```bash
+python src/phase3_run.py    # Pull 2015 image
+python src/phase3_2024.py   # Pull 2024 image
+```
+
+### Run Phase 3 — Change Detection
+```bash
+python src/phase3_infer.py
+```
+
 ### Run Training
 ```bash
 python src/train.py
@@ -257,7 +334,7 @@ python src/train.py
 | Geospatial       | rasterio, GDAL, geopandas, osmnx    |
 | Deep learning    | PyTorch, HuggingFace Transformers   |
 | Segmentation     | SegFormer-b2                         |
-| Change detection | ChangeFormer (Phase 3)               |
+| Change detection | SegFormer (mask comparison)          |
 | VLM              | LLaVA (Phase 4)                      |
 | Deployment       | FastAPI + Docker                     |
 
@@ -265,12 +342,12 @@ python src/train.py
 
 ## Results Summary
 
-| Phase | Task                    | Model        | Metric        | Result |
-|-------|-------------------------|--------------|---------------|--------|
-| 1     | Spectral analysis       | —            | NDVI mean     | 0.256  |
-| 2     | Semantic segmentation   | SegFormer-b2 | mIoU          | 0.338  |
-| 3     | Change detection        | ChangeFormer | F1 (planned)  | TBD    |
-| 4     | Visual QA               | LLaVA        | Acc (planned) | TBD    |
+| Phase | Task                    | Model        | Metric        | Result  |
+|-------|-------------------------|--------------|---------------|---------|
+| 1     | Spectral analysis       | —            | NDVI mean     | 0.256   |
+| 2     | Semantic segmentation   | SegFormer-b2 | mIoU          | 0.338   |
+| 3     | Change detection        | SegFormer-b2 | Change area   | ~30%    |
+| 4     | Visual QA               | LLaVA        | Acc (planned) | TBD     |
 
 ---
 
@@ -279,8 +356,8 @@ python src/train.py
 **Research question:** Investigating the application of foundation models
 and vision-language models to multispectral satellite imagery for automated
 object detection, semantic segmentation, and change detection. This research
-explores fine-tuning transformer-based architectures (SegFormer, ChangeFormer)
-on geospatial datasets and developing a retrieval-augmented VQA system over
+explores fine-tuning transformer-based architectures (SegFormer) on
+geospatial datasets and developing a retrieval-augmented VQA system over
 Sentinel-2 imagery.
 
 **Institution:** IIIT Kota — M.Tech in AI & Data Science
