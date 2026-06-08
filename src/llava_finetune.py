@@ -34,7 +34,8 @@ import transformers
 from datasets import Dataset
 from google.cloud import storage
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torch.utils.data import DataLoader
 from transformers import (
     AutoProcessor,
@@ -314,7 +315,7 @@ def train(args):
         logging_dir=str(ckpt_dir / "logs"),
         logging_steps=10,
         report_to="none",                    # disable wandb
-        dataloader_num_workers=2,
+        dataloader_num_workers=0,
         remove_unused_columns=False,         # keep pixel_values
         label_names=["labels"],
     )
