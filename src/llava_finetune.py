@@ -133,7 +133,7 @@ class RSVQADataset(torch.utils.data.Dataset):
         jsonl_path: Path,
         processor: AutoProcessor,
         image_cache: GCSImageCache,
-        max_length: int = 256,
+        max_length: int = 768,
     ):
         self.processor   = processor
         self.image_cache = image_cache
@@ -354,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--bucket",      default="geovision-data")
     parser.add_argument("--epochs",      type=int,   default=3)
     parser.add_argument("--batch-size",  type=int,   default=4)
-    parser.add_argument("--max-length",  type=int,   default=256)
+    parser.add_argument("--max-length",  type=int,   default=768)
     parser.add_argument("--skip-upload", action="store_true")
     args = parser.parse_args()
     train(args)
