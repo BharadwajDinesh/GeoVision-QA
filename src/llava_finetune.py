@@ -157,14 +157,12 @@ class RSVQADataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         convs  = sample["conversations"]
 
-        # Build the full prompt in LLaVA chat template
-        prompt = self.processor.apply_chat_template(
-            [
-                {"role": "user",      "content": convs[0]["value"]},
-                {"role": "assistant", "content": convs[1]["value"]},
-            ],
-            tokenize=False,
-        )
+        # Format prompt manually — apply_chat_template strips the <image> token
+        # causing "image tokens: 0, features: N" mismatch at training time.
+        # LLaVA-1.5 expects: "USER: <image>\n{question} ASSISTANT: {answer}"
+        question = convs[0]["value"]  # already contains "<image>\n..."
+        answer   = convs[1]["value"]
+        prompt   = f"USER: {question} ASSISTANT: {answer}"
 
         # Load image
         img_path = self.image_cache.get(sample["image"])
