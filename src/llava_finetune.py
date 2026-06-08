@@ -95,6 +95,34 @@ class GCSImageCache:
             blob.download_to_filename(str(local_path))
         return local_path
 
+    def prefetch_all(self, jsonl_paths: list) -> None:
+        """Pre-download all images referenced in JSONL files before training.
+        Avoids per-step GCS downloads which add 40+ seconds per batch."""
+        import json
+        from tqdm import tqdm
+        # Collect unique image paths across all splits
+        image_paths = set()
+        for jsonl_path in jsonl_paths:
+            with open(jsonl_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        image_paths.add(json.loads(line)["image"])
+
+        # Download missing images
+        missing = [p for p in image_paths
+                   if not (self.cache_dir / p).exists()]
+        if not missing:
+            print(f"  All {len(image_paths)} images already cached locally.")
+            return
+
+        print(f"  Pre-downloading {len(missing)}/{len(image_paths)} images to local disk …")
+        for rel_path in tqdm(missing):
+            try:
+                self.get(rel_path)
+            except Exception as e:
+                print(f"  [warn] Failed to download {rel_path}: {e}")
+
 
 def download_jsonl(bucket_name: str, gcs_path: str, local_path: Path) -> None:
     """Download a JSONL file from GCS."""
@@ -165,9 +193,12 @@ class RSVQADataset(torch.utils.data.Dataset):
         answer   = convs[1]["value"]
         prompt   = f"USER: {question} ASSISTANT: {answer}"
 
-        # Load image
+        # Load image — skip corrupted files with a blank fallback
         img_path = self.image_cache.get(sample["image"])
-        image    = Image.open(img_path).convert("RGB")
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except Exception:
+            image = Image.new("RGB", (256, 256), color=0)
 
         # Tokenize
         encoding = self.processor(
@@ -285,6 +316,10 @@ def train(args):
     # ── Build datasets ───────────────────────────────────────────────────────
     print("\n[3/4] Building datasets …")
     image_cache = GCSImageCache(args.bucket, GCS_PREFIX, cache_dir)
+
+    # Pre-download all images to local disk before training starts
+    # This moves GCS I/O out of the training loop entirely
+    image_cache.prefetch_all([local_data / "train.jsonl", local_data / "val.jsonl"])
 
     train_dataset = RSVQADataset(
         local_data / "train.jsonl", processor, image_cache,
