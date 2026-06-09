@@ -264,7 +264,7 @@ def load_model_and_processor(base_model: str):
     )
 
     # Prepare for k-bit training (freezes non-LoRA weights, casts norms)
-    model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
 
     print("  Attaching LoRA adapters …")
     model = get_peft_model(model, LORA_CONFIG)
@@ -336,7 +336,6 @@ def train(args):
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=4,       # effective batch = 16
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
@@ -345,14 +344,17 @@ def train(args):
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         weight_decay=0.01,
-        fp16=True,                           # needed with 4-bit quant
+        bf16=True,                           # bf16 faster than fp16 on L4
+        fp16=False,
         optim="paged_adamw_8bit",            # memory-efficient optimizer
+        gradient_checkpointing=False,        # disable — causes slowdown with QLoRA
         logging_dir=str(ckpt_dir / "logs"),
         logging_steps=10,
         report_to="none",                    # disable wandb
         dataloader_num_workers=0,
         remove_unused_columns=False,         # keep pixel_values
         label_names=["labels"],
+        gradient_accumulation_steps=2,       # reduce from 4 → more frequent updates
     )
 
     # ── Trainer ───────────────────────────────────────────────────────────────
