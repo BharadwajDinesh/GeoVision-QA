@@ -17,7 +17,9 @@ Phase 2: Object Detection & Segmentation         ✅ Complete
         ↓
 Phase 3: Change Detection (SegFormer)            ✅ Complete
         ↓
-Phase 4: VLM + RAG Deployment (LLaVA + FastAPI)  🔜 In Progress
+Phase 4: VLM Fine-tuning (LLaVA + QLoRA)        ✅ Complete
+        ↓
+Phase 4: FastAPI + RAG Deployment                🔜 In Progress
 ```
 
 ---
@@ -38,7 +40,10 @@ geovision/
 │   ├── phase2_run.py        # Phase 2 end-to-end pipeline runner
 │   ├── phase3_run.py        # Pull 2015 Koramangala composite
 │   ├── phase3_2024.py       # Pull 2024 Koramangala composite
-│   └── phase3_infer.py      # Change detection inference pipeline
+│   ├── phase3_infer.py      # Change detection inference pipeline
+│   ├── rsvqa_prep.py        # RSVQA-LR dataset preparation for LLaVA
+│   ├── llava_finetune.py    # LLaVA-1.5 QLoRA fine-tuning script
+│   └── llava_infer.py       # LLaVA inference on Koramangala imagery
 ├── notebooks/
 │   └── phase1_data_ingestion.ipynb
 ├── .gitignore
@@ -47,10 +52,10 @@ geovision/
 ```
 
 **Infrastructure:**
-- Compute  : GCP VM (n2-standard-4, 4 vCPU, 16GB RAM)
-- Training : Google Colab (T4 GPU, free tier)
-- Storage  : Google Cloud Storage (no local data storage)
-- Region   : us-central1
+- Compute        : GCP VM (e2-medium, us-central1-b)
+- GPU Training   : GCP VM (g2-standard-4, NVIDIA L4 24GB, northamerica-northeast1-c)
+- Storage        : Google Cloud Storage (no local data storage)
+- Region         : us-central1
 
 ---
 
@@ -249,14 +254,91 @@ gs://geovision-data/geovision/phase3/
 
 ---
 
-## Phase 4 — VLM + Deployment 🔜
+## Phase 4 — VLM Fine-tuning ✅
+
+### What it does
+- Downloads RSVQA-LR dataset (Zenodo record 6344334) — 772 Sentinel-2
+  satellite images with 77,000 Q&A pairs
+- Applies stratified sampling across 4 question types (presence, count,
+  comparison, rural_urban) for balanced training
+- Converts dataset to LLaVA conversation format (JSONL)
+- Fine-tunes LLaVA-1.5-7B using QLoRA (8-bit) on GCP L4 GPU VM
+- Uploads LoRA adapter checkpoint to GCS
+
+### Dataset — RSVQA-LR
+- **Source:** Zenodo record 6344334
+- **Images:** 772 Sentinel-2 satellite tiles (256×256 px, RGB)
+- **Q&A pairs:** 57,223 training / 10,005 validation
+- **Question types:** presence, count, comparison, rural_urban
+- **Stratified sample used:** 20 samples (5 per question type)
+
+### Model — LLaVA-1.5-7B + QLoRA
+- Base model    : `llava-hf/llava-1.5-7b-hf`
+- Quantization  : 8-bit (bitsandbytes)
+- LoRA rank     : 16, alpha 32
+- Target modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+- Trainable params: 42,336,256 (0.596% of total)
+- Optimizer     : paged_adamw_8bit (lr=2e-4)
+- Scheduler     : Cosine annealing
+- Epochs        : 3
+- Batch size    : 4
+- Training VM   : GCP g2-standard-4 (NVIDIA L4 24GB)
+
+### Pipeline
+```
+Zenodo (RSVQA-LR)
+    ↓
+rsvqa_prep.py — download, stratified sample, convert to LLaVA JSONL
+    ↓
+GCS: train.jsonl, val.jsonl, Images_LR/ (772 images)
+    ↓
+llava_finetune.py — prefetch images, QLoRA fine-tuning on L4 GPU
+    ↓
+GCS: best_llava_rsvqa/ (LoRA adapter checkpoint)
+```
+
+### Key Engineering Challenges Solved
+- **Zenodo URL format** — migrated from `/record/` to `/records/{id}/files/{name}/content`
+- **Inactive dataset records** — RSVQA JSON contains placeholder entries
+  `{id: N, active: False}` — fixed by filtering on `active` flag before building lookup maps
+- **Image token mismatch** — LLaVA's `<image>` token expands to 576 patch
+  tokens; `apply_chat_template` was stripping it. Fixed by formatting prompts
+  manually as `USER: <image>\n{question} ASSISTANT: {answer}`
+- **max_length too short** — 256 tokens truncated the 576 image tokens.
+  Increased to 768.
+- **GCS image download bottleneck** — per-step GCS downloads caused 47s/step.
+  Fixed by prefetching all 772 images to local disk before training starts,
+  reducing to ~16s/step.
+- **OOM on L4** — batch size 8 without gradient checkpointing exceeded 23GB.
+  Fixed by re-enabling gradient checkpointing and reducing batch to 4.
+
+### GCS Artifacts
+```
+gs://geovision-data/geovision/phase4/
+├── rsvqa/
+│   ├── train.jsonl                    # 57,223 LLaVA-format Q&A pairs
+│   ├── val.jsonl                      # 10,005 validation pairs
+│   └── Images_LR/                     # 772 satellite image tiles
+└── checkpoints/
+    └── best_llava_rsvqa/
+        ├── adapter_config.json        # LoRA configuration
+        ├── adapter_model.safetensors  # Fine-tuned LoRA weights
+        ├── tokenizer.json             # Tokenizer
+        ├── tokenizer_config.json
+        └── processor_config.json
+```
+
+---
+
+## Phase 4 — FastAPI + RAG Deployment 🔜
 
 ### Goal
-Natural language question answering over satellite imagery.
+Natural language question answering over satellite imagery via REST API.
 
 ### Plan
-- Fine-tune LLaVA on RSVQA dataset for satellite image Q&A
-- FastAPI endpoint on GCP VM
+- FastAPI endpoint on GCP VM (geovision-vm, e2-medium)
+- Load fine-tuned LLaVA adapter from GCS
+- RAG context from Phase 3 change statistics
 - Docker containerization
 - Live endpoint answering questions like:
   - "What changed in Koramangala since 2015?"
@@ -269,11 +351,11 @@ Natural language question answering over satellite imagery.
 FastAPI (serves the API)
     ↓
 SegFormer  (segmentation  — Phase 2)
-ChangeFormer (change detection — Phase 3)
-LLaVA + RAG  (VQA — Phase 4)
+SegFormer  (change detection — Phase 3)
+LLaVA-1.5-7B + LoRA adapter + RAG  (VQA — Phase 4)
     ↓
 Docker (containerised)
-GCP VM (hosted)
+GCP VM (hosted, e2-medium, us-central1-b)
 ```
 
 ---
@@ -316,7 +398,24 @@ python src/phase3_2024.py   # Pull 2024 image
 python src/phase3_infer.py
 ```
 
-### Run Training
+### Run Phase 4 — Prepare RSVQA Dataset
+```bash
+python src/rsvqa_prep.py --bucket geovision-data
+```
+
+### Run Phase 4 — Fine-tune LLaVA
+```bash
+# Run on GCP GPU VM (g2-standard-4, NVIDIA L4)
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python3 src/llava_finetune.py --bucket geovision-data --epochs 3 --batch-size 4
+```
+
+### Run Phase 4 — Inference
+```bash
+python src/llava_infer.py --bucket geovision-data --generate-report
+```
+
+### Run Training (SegFormer)
 ```bash
 python src/train.py
 ```
@@ -329,25 +428,27 @@ python src/train.py
 |------------------|--------------------------------------|
 | Satellite data   | Google Earth Engine + Sentinel-2     |
 | Cloud storage    | Google Cloud Storage                 |
-| Compute          | GCP VM (n2-standard-4)              |
-| Training         | Google Colab (T4 GPU)               |
+| Compute          | GCP VM (e2-medium, us-central1-b)   |
+| GPU Training     | GCP VM (g2-standard-4, NVIDIA L4)   |
 | Geospatial       | rasterio, GDAL, geopandas, osmnx    |
 | Deep learning    | PyTorch, HuggingFace Transformers   |
 | Segmentation     | SegFormer-b2                         |
 | Change detection | SegFormer (mask comparison)          |
-| VLM              | LLaVA (Phase 4)                      |
+| VLM              | LLaVA-1.5-7B + QLoRA (8-bit)        |
+| VLM fine-tuning  | PEFT, bitsandbytes, TRL              |
 | Deployment       | FastAPI + Docker                     |
 
 ---
 
 ## Results Summary
 
-| Phase | Task                    | Model        | Metric        | Result  |
-|-------|-------------------------|--------------|---------------|---------|
-| 1     | Spectral analysis       | —            | NDVI mean     | 0.256   |
-| 2     | Semantic segmentation   | SegFormer-b2 | mIoU          | 0.338   |
-| 3     | Change detection        | SegFormer-b2 | Change area   | ~30%    |
-| 4     | Visual QA               | LLaVA        | Acc (planned) | TBD     |
+| Phase | Task                    | Model              | Metric          | Result  |
+|-------|-------------------------|--------------------|-----------------|---------|
+| 1     | Spectral analysis       | —                  | NDVI mean       | 0.256   |
+| 2     | Semantic segmentation   | SegFormer-b2       | mIoU            | 0.338   |
+| 3     | Change detection        | SegFormer-b2       | Change area     | ~30%    |
+| 4     | VLM fine-tuning         | LLaVA-1.5-7B QLoRA | Trainable params | 0.596% |
+| 4     | Visual QA               | LLaVA-1.5-7B       | Acc (planned)   | TBD     |
 
 ---
 
