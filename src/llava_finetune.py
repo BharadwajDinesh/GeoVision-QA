@@ -264,7 +264,7 @@ def load_model_and_processor(base_model: str):
     )
 
     # Prepare for k-bit training (freezes non-LoRA weights, casts norms)
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     print("  Attaching LoRA adapters …")
     model = get_peft_model(model, LORA_CONFIG)
@@ -347,7 +347,7 @@ def train(args):
         bf16=True,                           # bf16 faster than fp16 on L4
         fp16=False,
         optim="paged_adamw_8bit",            # memory-efficient optimizer
-        gradient_checkpointing=False,        # disable — causes slowdown with QLoRA
+        gradient_checkpointing=True,         # re-enable to save VRAM
         logging_dir=str(ckpt_dir / "logs"),
         logging_steps=10,
         report_to="none",                    # disable wandb
