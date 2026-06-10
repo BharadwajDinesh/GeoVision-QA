@@ -9,10 +9,10 @@ osmnx==1.9.3
 shapely==2.0.4
 # ── Deep learning ─────────────────────────────────────────────────────────────
 # torch + torchvision installed separately in Dockerfile (CPU or CUDA wheel)
-transformers==4.41.2
-peft==0.11.1
-bitsandbytes==0.43.1
-accelerate==0.30.1
+transformers==4.46.3
+peft==0.19.1
+bitsandbytes==0.44.1
+accelerate==1.1.1
 trl==0.9.4
 datasets==2.19.1
 sentencepiece==0.2.0
