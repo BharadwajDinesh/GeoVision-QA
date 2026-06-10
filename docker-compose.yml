@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  geovision-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geovision-api:latest
+    container_name: geovision-api
+    ports:
+      - "8080:8080"
+    environment:
+      # ── GCS ──────────────────────────────────────────────────────────────
+      GCS_BUCKET: ${GCS_BUCKET:-geovision-data}
+
+      # ── GCP auth: mount your service-account JSON at the path below ──────
+      # On the GCP VM this is handled by the instance's workload identity,
+      # so you can remove the GOOGLE_APPLICATION_CREDENTIALS line there.
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp_sa_key
+
+      # ── App config ────────────────────────────────────────────────────────
+      MAX_IMAGE_MB: ${MAX_IMAGE_MB:-20}
+      PORT: 8080
+
+    volumes:
+      # Mount your service-account JSON for local development
+      # On GCP VM with Workload Identity this mount is not needed
+      - ${GCP_SA_KEY_PATH:-~/.config/gcloud/application_default_credentials.json}:/run/secrets/gcp_sa_key:ro
+
+    # Give the container enough memory for LLaVA-1.5-7B (8-bit ≈ 8 GB)
+    deploy:
+      resources:
+        limits:
+          memory: 10g
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s   # model loading takes ~2 min on first start
