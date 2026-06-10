@@ -17,7 +17,6 @@ from __future__ import annotations
 import io
 import logging
 from functools import lru_cache
-from typing import Optional
 
 import numpy as np
 from google.cloud import storage

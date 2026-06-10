@@ -22,7 +22,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
