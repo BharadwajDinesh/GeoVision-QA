@@ -17,9 +17,9 @@ Phase 2: Object Detection & Segmentation         ✅ Complete
         ↓
 Phase 3: Change Detection (SegFormer)            ✅ Complete
         ↓
-Phase 4: VLM Fine-tuning (LLaVA + QLoRA)        ✅ Complete
+Phase 4a: VLM Fine-tuning (LLaVA + QLoRA)       ✅ Complete
         ↓
-Phase 4: FastAPI + RAG Deployment                🔜 In Progress
+Phase 4b: FastAPI + RAG Deployment              ✅ Complete (live on GPU)
 ```
 
 ---
@@ -43,19 +43,33 @@ geovision/
 │   ├── phase3_infer.py      # Change detection inference pipeline
 │   ├── rsvqa_prep.py        # RSVQA-LR dataset preparation for LLaVA
 │   ├── llava_finetune.py    # LLaVA-1.5 QLoRA fine-tuning script
-│   └── llava_infer.py       # LLaVA inference on Koramangala imagery
+│   ├── llava_infer.py       # LLaVA inference on Koramangala imagery
+│   └── api/                 # Phase 4b — FastAPI serving package
+│       ├── main.py          # FastAPI app + all routes
+│       ├── model_loader.py  # Loads SegFormer + LLaVA+LoRA from GCS at startup
+│       ├── inference.py     # Segmentation, change detection, VQA pipelines
+│       ├── rag_context.py   # Builds RAG context from Phase 3 change stats
+│       └── observability.py # Langfuse tracing for every request
 ├── notebooks/
 │   └── phase1_data_ingestion.ipynb
+├── .github/
+│   └── workflows/
+│       └── deploy.yml       # CI/CD: lint → build → push → deploy to GPU VM
+├── Dockerfile               # CUDA-enabled image for GPU inference
+├── docker-compose.yml
 ├── .gitignore
 ├── requirements.txt
 └── README.md
 ```
 
 **Infrastructure:**
-- Compute        : GCP VM (e2-medium, us-central1-b)
-- GPU Training   : GCP VM (g2-standard-4, NVIDIA L4 24GB, northamerica-northeast1-c)
+- API Serving    : GCP VM (g2-standard-4, NVIDIA L4 24GB, asia-south1-b)
+- GPU Training   : GCP VM (g2-standard-4, NVIDIA L4 24GB)
+- Container Reg. : GCP Artifact Registry (us-central1)
 - Storage        : Google Cloud Storage (no local data storage)
-- Region         : us-central1
+- CI/CD          : GitHub Actions (auto build + deploy on push to main)
+- Observability  : Langfuse (US region) — per-request tracing
+- Region         : us-central1 (registry/storage), asia-south1 (serving)
 
 ---
 
@@ -254,7 +268,7 @@ gs://geovision-data/geovision/phase3/
 
 ---
 
-## Phase 4 — VLM Fine-tuning ✅
+## Phase 4a — VLM Fine-tuning ✅
 
 ### What it does
 - Downloads RSVQA-LR dataset (Zenodo record 6344334) — 772 Sentinel-2
@@ -330,33 +344,114 @@ gs://geovision-data/geovision/phase4/
 
 ---
 
-## Phase 4 — FastAPI + RAG Deployment 🔜
+## Phase 4b — FastAPI + RAG Deployment ✅
 
-### Goal
-Natural language question answering over satellite imagery via REST API.
+### What it does
+Serves the entire pipeline as a live REST API on a GPU VM. Natural language
+question answering over satellite imagery, semantic segmentation, and change
+detection — all behind HTTP endpoints, containerised, auto-deployed via CI/CD,
+and fully traced with Langfuse.
 
-### Plan
-- FastAPI endpoint on GCP VM (geovision-vm, e2-medium)
-- Load fine-tuned LLaVA adapter from GCS
-- RAG context from Phase 3 change statistics
-- Docker containerization
-- Live endpoint answering questions like:
-  - "What changed in Koramangala since 2015?"
-  - "How many new buildings appeared?"
-  - "Has vegetation decreased?"
-  - "What is the land cover of this area?"
+### Live API Endpoints
+| Method | Endpoint         | Purpose                                            |
+|--------|------------------|----------------------------------------------------|
+| GET    | `/health`        | Health check + model load status                  |
+| GET    | `/rag-context`   | Inspect the RAG knowledge base                    |
+| POST   | `/segment`       | Semantic segmentation of an uploaded image        |
+| POST   | `/change-detect` | Change detection between two uploaded images      |
+| POST   | `/vqa`           | Visual QA (LLaVA + RAG) on an uploaded image      |
+| POST   | `/analyze`       | Full pipeline: segmentation + VQA in one call     |
 
 ### Deployment Stack
 ```
-FastAPI (serves the API)
+FastAPI (serves the API on GPU VM)
     ↓
-SegFormer  (segmentation  — Phase 2)
-SegFormer  (change detection — Phase 3)
-LLaVA-1.5-7B + LoRA adapter + RAG  (VQA — Phase 4)
+SegFormer-b2        (segmentation + change detection — Phase 2/3)
+LLaVA-1.5-7B + LoRA (VQA — Phase 4a)
+RAG layer           (Phase 3 change stats injected into every prompt)
     ↓
-Docker (containerised)
-GCP VM (hosted, e2-medium, us-central1-b)
+Docker (CUDA 12.4 image, --gpus all)
+GCP VM (g2-standard-4, NVIDIA L4, asia-south1-b)
+    ↓
+GitHub Actions CI/CD (lint → build → push → deploy)
+Langfuse (per-request tracing)
 ```
+
+### RAG Layer
+On startup the API loads Phase 3 segmentation masks (`seg_2015.npy`,
+`seg_2024.npy`, `change_map.npy`) from GCS, computes live class distributions
+and change-type breakdowns, and formats them into a knowledge-base text block.
+This context is prepended to every LLaVA prompt so answers are grounded in
+real change statistics rather than hallucinated numbers. The context is cached
+after first build.
+
+### CI/CD Pipeline (GitHub Actions)
+Three jobs run on every push to `main`:
+1. **Lint & Import Check** — `ruff` + `py_compile` on the API package
+2. **Build & Push** — builds the CUDA Docker image, pushes to Artifact Registry
+   with layer caching
+3. **Deploy** — SSHes into the GPU VM via IAP, authenticates Docker to the
+   registry using the VM service-account token, pulls the new image, and
+   restarts the container with `--gpus all`
+
+### Observability (Langfuse)
+Every API request creates a trace with child spans:
+```
+vqa (trace)
+ ├── rag-context-retrieval  (span)       — context size, latency
+ └── llava-vqa              (generation) — full prompt, answer, latency
+```
+This gives full visibility into the RAG pipeline — what was retrieved, what
+prompt was sent to the model, the generated answer, and per-step latency —
+for debugging and performance analysis.
+
+### Key Engineering Challenges Solved
+- **GDAL build failure in Docker** — pip GDAL failed to compile (`g++ not
+  found`). Fixed by adding build tools + GDAL system libraries and pinning
+  pip's GDAL to the system version dynamically via `gdal-config --version`.
+- **No GPU for 8-bit quantization** — the initial e2-medium serving VM had no
+  GPU, so `bitsandbytes` 8-bit loading failed. Migrated serving to an L4 GPU
+  VM with manual NVIDIA driver + Container Toolkit install, and switched the
+  Docker base image to `nvidia/cuda:12.4.0-runtime` with CUDA-build PyTorch.
+- **PEFT version mismatch** — the adapter was saved with PEFT 0.19.1 but the
+  container had 0.11.1, which didn't recognise newer config fields. Fixed by
+  bumping peft/transformers/accelerate/bitsandbytes to matching versions.
+- **Registry auth over SSH** — `docker pull` over non-interactive SSH didn't
+  pick up the gcloud credential helper. Fixed by authenticating with the VM's
+  service-account access token via the metadata server.
+- **Langfuse region mismatch** — keys belonged to a US-region project but the
+  host was set to the generic `cloud.langfuse.com`, causing 401s. Fixed by
+  setting `LANGFUSE_HOST` to `https://us.cloud.langfuse.com`.
+- **Firewall** — port 8080 was not open; added a firewall rule targeting the
+  `geovision-api` network tag.
+
+### Example Request
+```bash
+curl -X POST http://<vm-ip>:8080/vqa \
+  -F "image=@satellite.png" \
+  -F "question=What land cover types are visible in this satellite image?" \
+  -F "use_rag=true"
+```
+```json
+{
+  "request_id": "0a028f09",
+  "question": "What land cover types are visible in this satellite image?",
+  "answer": "In the satellite image, the visible land cover types include buildings, vegetation, roads, and water bodies.",
+  "rag_used": true
+}
+```
+
+### Known Issues (to address before final evaluation)
+- **LoRA adapter weights not attaching** — newer transformers renamed LLaVA's
+  internal layer keys, so PEFT reports all adapter keys as "missing" and VQA
+  currently runs on *base* LLaVA rather than the fine-tuned weights. Requires
+  aligning the transformers version with training or re-saving the adapter.
+- **SegFormer classifier head** — the checkpoint's classifier layer shape
+  (150 ADE classes) doesn't match the 5-class head, so it loads randomly
+  initialised; segmentation output needs the head weights remapped.
+- **Model re-download on startup** — the LLaVA base + adapter re-download from
+  GCS/HuggingFace on every container start; a persistent disk cache would make
+  restarts near-instant.
 
 ---
 
@@ -420,6 +515,28 @@ python src/llava_infer.py --bucket geovision-data --generate-report
 python src/train.py
 ```
 
+### Phase 4b — Deploy the API
+Deployment is automated via GitHub Actions on every push to `main`. To run
+the API locally for development:
+```bash
+uvicorn src.api.main:app --reload --port 8080
+```
+
+To build and run the container manually:
+```bash
+docker build -t geovision-api .
+docker run --gpus all -p 8080:8080 \
+  -e GCS_BUCKET=geovision-data \
+  -e LANGFUSE_PUBLIC_KEY=pk-lf-... \
+  -e LANGFUSE_SECRET_KEY=sk-lf-... \
+  -e LANGFUSE_HOST=https://us.cloud.langfuse.com \
+  geovision-api
+```
+
+The GitHub Actions workflow requires these repository secrets: `GCP_PROJECT_ID`,
+`GCP_SA_KEY`, `GCP_REGION`, `API_VM_NAME`, `API_VM_ZONE`, `LANGFUSE_PUBLIC_KEY`,
+`LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`.
+
 ---
 
 ## Tech Stack
@@ -436,7 +553,11 @@ python src/train.py
 | Change detection | SegFormer (mask comparison)          |
 | VLM              | LLaVA-1.5-7B + QLoRA (8-bit)        |
 | VLM fine-tuning  | PEFT, bitsandbytes, TRL              |
-| Deployment       | FastAPI + Docker                     |
+| API serving      | FastAPI + Uvicorn                    |
+| Containerisation | Docker (CUDA 12.4 base image)        |
+| Serving compute  | GCP VM (g2-standard-4, NVIDIA L4)   |
+| CI/CD            | GitHub Actions + Artifact Registry  |
+| Observability    | Langfuse                             |
 
 ---
 
@@ -447,8 +568,9 @@ python src/train.py
 | 1     | Spectral analysis       | —                  | NDVI mean       | 0.256   |
 | 2     | Semantic segmentation   | SegFormer-b2       | mIoU            | 0.338   |
 | 3     | Change detection        | SegFormer-b2       | Change area     | ~30%    |
-| 4     | VLM fine-tuning         | LLaVA-1.5-7B QLoRA | Trainable params | 0.596% |
-| 4     | Visual QA               | LLaVA-1.5-7B       | Acc (planned)   | TBD     |
+| 4a    | VLM fine-tuning         | LLaVA-1.5-7B QLoRA | Trainable params | 0.596% |
+| 4a    | Visual QA               | LLaVA-1.5-7B       | Acc (planned)   | TBD     |
+| 4b    | API deployment          | FastAPI + Docker   | Endpoints live  | 6/6 ✅  |
 
 ---
 
